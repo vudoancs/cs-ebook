@@ -232,19 +232,176 @@ Khi chuyển: chuẩn hóa event ID/schema → triển khai consumer idempotent 
 
 ## 11. Câu trả lời phỏng vấn
 
-**Why BullMQ for Stripe webhooks?**
+Câu trả lời dùng tiếng Anh đơn giản để dễ nói. Mỗi câu có ý chính tiếng Việt và ví dụ để hiểu rõ. Dùng “I would” khi trình bày cách thiết kế; chỉ đổi thành “we used” nếu đã thực sự làm.
 
-“We chose BullMQ because the workload was background job processing in our NestJS application, and we already operated Redis. We used retries and backoff, with idempotent database updates to handle duplicate delivery. We acknowledged webhooks only after durable acceptance.”
+### 11.1. Chọn công cụ và trade-off
 
-**When would you consider RabbitMQ?**
+**1. Why would you choose BullMQ for Stripe webhooks?**
 
-“When multiple independent services need event routing and their own queues, RabbitMQ can make that topology easier to manage. For example, Booking, Accounting, and Loyalty can each consume payment events and recover independently.”
+> I would choose BullMQ because the app uses NestJS and already has Redis. It gives us background jobs, retries, and delayed jobs. It is a good fit when we mainly need workers to process tasks.
 
-**When would you consider Kafka?**
+Ý chính: Phù hợp nhu cầu và hạ tầng có sẵn. Đổi lại, team vẫn phải vận hành Redis đủ an toàn cho queue.
 
-“When we need retained event history, independent consumer groups, and replay for analytics or rebuilding projections. Kafka would not remove the need for idempotency, especially for external payment operations.”
+**2. What is the trade-off of using BullMQ?**
 
-Các câu trả lời trên là mẫu; chỉ dùng “we used” cho những phần bạn đã thực sự triển khai.
+> It is easy to add to our app, but we still need to keep Redis reliable. If several services need the same event, we need to create separate jobs or queues. I would review the design when that becomes hard to manage.
+
+Ví dụ: Booking, Accounting và Loyalty đều cần payment event → phải bảo đảm giao đủ cho từng bên, không chỉ tạo một job cho ba worker tranh nhau nhận.
+
+**3. When would you consider RabbitMQ?**
+
+> I would consider RabbitMQ when several services need their own copy of an event. For example, Booking, Accounting, and Loyalty can each have a queue. Each service can process and retry messages on its own.
+
+Ý chính: Mỗi service có queue riêng; nhiều service không tự động có nghĩa phải chuyển broker.
+
+**4. What is the trade-off of using RabbitMQ?**
+
+> It makes message routing easier, but we have another system to run. We need to set up queues, routing rules, retries, and alerts. I would use it when those benefits are worth the extra work.
+
+Ví dụ: Chỉ có một backend xử lý payment thì thêm RabbitMQ có thể chưa đem lại nhiều lợi ích.
+
+**5. When would you consider Kafka?**
+
+> I would consider Kafka when we need to keep events and read them again later. For example, a new reporting service may need last month's payment events. This only works if Kafka still has those events.
+
+Ý chính: Replay phụ thuộc retention và dữ liệu thực tế còn được giữ.
+
+**6. Why not use Kafka from the start?**
+
+> Kafka needs more setup and care. We need to manage partitions, stored data, and consumer progress. For a small webhook workflow, BullMQ may meet the need with less work.
+
+Trade-off: Khả năng lưu và đọc lại event đổi lấy chi phí vận hành. Nếu công ty đã có Kafka được quản lý tốt thì đánh giá có thể khác.
+
+**7. Does higher traffic mean we must change the queue system?**
+
+> No. I would first check what is slow. We may need more workers, better database queries, or a limit on API calls. Changing the queue will not fix a slow database.
+
+Ví dụ: Worker mất 5 giây vì query thiếu index → kiểm tra query trước khi đổi broker.
+
+**8. What is the trade-off of adding more workers?**
+
+> More workers can process more jobs at the same time. But they also create more database connections and API calls. I would increase the number step by step and watch errors and processing time.
+
+Ví dụ: Tăng worker quá nhanh có thể làm DB quá tải hoặc gặp rate limit từ Stripe.
+
+**9. How do you balance order and speed?**
+
+> Running jobs in parallel is faster, but they may finish in a different order. If order matters, I would process events for the same booking one at a time. Different bookings can still run in parallel.
+
+Ý chính: Cần cơ chế tuần tự theo booking hoặc kiểm tra trạng thái/version trong DB. Kafka key giúp gom cùng partition; nhiều worker BullMQ không tự tuần tự theo booking. Stripe vẫn có thể gửi event sai thứ tự từ đầu.
+
+**10. Can we use more than one tool?**
+
+> Yes. We can use RabbitMQ or Kafka to share events between services, and BullMQ for delayed jobs such as reminders. But I would only add another tool when it solves a clear problem.
+
+Trade-off: Mỗi công cụ làm đúng việc, nhưng team phải theo dõi và vận hành nhiều hệ thống hơn.
+
+### 11.2. Failure handling — xử lý lỗi
+
+**11. What if Stripe sends the same event twice?**
+
+> I would use the Stripe event ID to detect repeated events. The database change and the record that says “processed” should be saved in the same transaction. This prevents the same event from changing the data twice.
+
+Ví dụ: `evt_123` tới hai lần nhưng chỉ ghi doanh thu một lần. Unique key theo consumer + event ID giúp mỗi service xử lý độc lập. Với hai event ID khác nhau cùng tác động một payment, vẫn cần kiểm tra trạng thái và ràng buộc nghiệp vụ.
+
+**12. What if the queue is down when a webhook arrives?**
+
+> If we save the event in a database inbox first, we can return success and send it to the queue later. If we send directly to the queue and that fails, I would return an error so Stripe can retry.
+
+Ý chính: Chỉ trả `2xx` khi đã tiếp nhận bền vững. Inbox cần dispatcher quét lại các bản ghi chưa giao.
+
+**13. What if a worker crashes while processing a job?**
+
+> The job may be delivered again. I would make it safe to run more than once. If the database update already succeeded, the next attempt should detect that and avoid repeating the change.
+
+Ví dụ: Worker ghi payment thành công rồi chết trước khi xác nhận hoàn tất → lần chạy sau không cộng doanh thu lần nữa.
+
+**14. What if the database is down?**
+
+> I would not mark the job as done. I would retry with a delay and send an alert if the problem continues. After the retry limit, I would keep the failed job for review and retry it after the database recovers.
+
+Ý chính: BullMQ giữ failed job; RabbitMQ dùng retry/DLQ theo thiết kế; Kafka cần chính sách retry/offset rõ ràng. Không để một lỗi lặp vô hạn mà không cảnh báo.
+
+**15. What if a Stripe API call times out?**
+
+> A timeout does not mean the action failed. Stripe may have completed it before the connection broke. I would check the result and use the same idempotency key when retrying a supported request.
+
+Ví dụ: Refund timeout → không tạo ngay một refund mới với key mới. Cần key ổn định theo thao tác và đối soát kết quả.
+
+**16. Which errors should we retry?**
+
+> I would retry short-term problems, such as a network failure or a rate limit. I would not keep retrying invalid data. I would wait longer between attempts and stop after a set limit.
+
+Ví dụ: API trả `429` → chờ theo hướng dẫn của API; thiếu `bookingId` bắt buộc → đưa vào luồng kiểm tra/sửa dữ liệu. Phân loại dựa trên mã lỗi và ngữ cảnh, không chỉ dựa vào mọi lỗi `4xx` hay `5xx`.
+
+**17. What do you do when all retries fail?**
+
+> I would keep the event in a failed state or a dead-letter queue. I would send a Telegram alert with the event ID and error. After fixing the cause, an admin can retry it with a record of who did it.
+
+Ý chính: DLQ là nơi giữ lỗi để xử lý tiếp, không phải tự động sửa lỗi. Replay cần quyền truy cập và audit log.
+
+**18. What if events arrive in the wrong order?**
+
+> I would check the current payment state before changing it. An old event should not move the payment back to an earlier state. If the result is unclear, I would check the latest state in Stripe.
+
+Ví dụ: Event cũ không được chuyển payment từ `SUCCEEDED` về `PROCESSING`. State machine vẫn phải cho phép các bước hợp lệ như refund hoặc dispute sau khi thanh toán thành công.
+
+**19. What if payment succeeds but sending the email fails?**
+
+> I would keep the payment successful and retry the email separately. I would save an email task in an outbox in the same transaction as the payment update. A worker can send it later.
+
+Ý chính: Không yêu cầu khách thanh toán lại vì email lỗi. Nếu nhà cung cấp email không hỗ trợ dedupe, crash sau khi gửi vẫn có thể gây email trùng; cần chấp nhận hoặc giảm rủi ro này theo yêu cầu sản phẩm.
+
+**20. What if Accounting is down but Booking is still running?**
+
+> If the services have separate queues or consumer groups, Booking can keep working. Accounting can catch up when it recovers. I would watch how far it falls behind and alert before the delay becomes too large.
+
+Trade-off: Dữ liệu giữa các service có thể cập nhật lệch thời điểm. Với Kafka, Accounting phải phục hồi trước khi event cần đọc bị xóa theo retention.
+
+**21. How do you safely replay old events?**
+
+> I would first check what the consumer does. Rebuilding a report is different from sending a refund. I would test the replay on separate data and make sure it cannot repeat payments or other actions.
+
+Ví dụ: Dựng báo cáo vào bảng mới rồi so sánh. Không chạy lại toàn bộ consumer có thao tác refund để sửa báo cáo.
+
+**22. When should you acknowledge a message or commit an offset?**
+
+> I would do it after the database work succeeds, or after the event is safely saved for later processing. If I do it too early, we may lose work. If I do it later, we must be ready to handle the same event again.
+
+Ý chính: RabbitMQ consumer ack và Kafka offset đánh dấu tiến độ; không bao phủ transaction DB bên ngoài. Kafka không được commit vượt event chưa xử lý nếu chưa có cơ chế phục hồi an toàn.
+
+**23. How do you know which service failed?**
+
+> I would follow the event ID in logs and traces. I would also check each service's queue, errors, and last successful step. Telegram should link to the dashboard so we can find the problem quickly.
+
+Ví dụ: Booking thành công, Accounting pending 12 phút → xem consumer Accounting và lỗi DB của nó. Queue depth hoặc Kafka lag một mình không cho biết đầy đủ trạng thái nghiệp vụ của từng event.
+
+**24. Can the queue guarantee that a payment is processed exactly once?**
+
+> I would not rely on the queue alone for that. Messages can be delivered again after a failure. We need database rules, safe retries, and checks against Stripe to prevent duplicate payment actions.
+
+Ý chính: Không hứa “exactly once” cho toàn bộ luồng chỉ vì broker có một tính năng bảo đảm giao nhận.
+
+### 11.3. Cách trả lời ngắn và rõ
+
+Dùng thứ tự: **vấn đề → cách xử lý → đánh đổi → cách kiểm tra**.
+
+Ví dụ câu hỏi “What if a worker crashes?”:
+
+> The job may run again. I would use a database transaction and a unique event record to prevent duplicate changes. This adds some database work, but protects payment data. I would test it by stopping the worker after the database update and checking that a retry does not create a second payment record.
+
+| Từ/cụm từ | Nghĩa dễ nhớ |
+|---|---|
+| retry | Thử lại |
+| backoff | Chờ lâu hơn giữa các lần thử |
+| idempotent | Chạy lại mà không tạo thêm tác động trùng |
+| acknowledge / ack | Xác nhận đã xử lý message |
+| dead-letter queue / DLQ | Queue giữ message lỗi cần xử lý tiếp |
+| replay | Đọc hoặc xử lý lại sự kiện cũ |
+| trade-off | Lợi ích nhận được và cái giá phải trả |
+| catch up | Xử lý phần còn tồn đọng để theo kịp |
+| inbox | Nơi lưu event nhận vào trước khi xử lý |
+| outbox | Nơi lưu việc/event cần gửi sau khi cập nhật DB |
 
 ## 12. Tài liệu tham khảo chính thức
 
